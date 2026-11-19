@@ -137,6 +137,7 @@ The sync vs async endpoint is chosen automatically based on calculation type (3D
 The code recognizes if the JSON file from the API payload is of 2D or 3D type, and makes the call to one or another endpoint. The SDK code handles that for you.
 
 Polling frequency and connection timeout are controlled by `MODELCHAIN_ASYNC_POLL_TIME` and `MODELCHAIN_ASYNC_TIMEOUT_CONNECTION` in `config.py`.
+Failed status checks (network errors, HTTP 408/429/5xx) are retried with exponential backoff, up to `MODELCHAIN_ASYNC_MAX_POLL_RETRIES` consecutive failures. Once a calculation has started, a `SolarFarmerAPIError` raised for it carries its `instance_id`, because the calculation may still be running on the server.
 
 ### Logging
 The SDK uses a `NullHandler` by default (no output). Always call `configure_logging()` before running:

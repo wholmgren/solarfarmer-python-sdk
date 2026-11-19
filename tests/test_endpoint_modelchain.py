@@ -6,6 +6,7 @@ import pytest
 
 import solarfarmer
 from solarfarmer.api import Response, SolarFarmerAPIError
+from solarfarmer.config import MODELCHAIN_ASYNC_MAX_POLL_RETRIES, MODELCHAIN_ASYNC_POLL_TIME
 from solarfarmer.endpoint_modelchains import (
     _handle_successful_response,
     _log_api_failure,
@@ -235,6 +236,37 @@ class TestHandleSuccessfulResponse:
         assert result is None
         mock_p.assert_not_called()
 
+    def test_async_response_without_runtime_status_raises(self):
+        """An async response with no status (e.g. the POST acknowledgement) must not map to results."""
+        response = Response(
+            code=200,
+            url="https://api.example.com/modelchainasync",
+            data={"id": "inst-1"},
+            success=True,
+            method="POST",
+            instance_id="inst-1",
+        )
+        with patch("solarfarmer.endpoint_modelchains.process_and_map_results") as mock_p:
+            with pytest.raises(SolarFarmerAPIError) as exc_info:
+                _handle_successful_response(response, 1.0, "proj1", None, None, None, False, False)
+        mock_p.assert_not_called()
+        assert exc_info.value.instance_id == "inst-1"
+        assert "runtimeStatus" in str(exc_info.value)
+
+    def test_failed_async_status_error_carries_instance_id(self):
+        response = Response(
+            code=200,
+            url="https://api.example.com/modelchainasync",
+            data={"instanceId": "inst-1", "runtimeStatus": "Failed", "output": None},
+            success=True,
+            method="GET",
+            instance_id="inst-1",
+        )
+        with pytest.raises(SolarFarmerAPIError) as exc_info:
+            _handle_successful_response(response, 1.0, "proj1", None, None, None, False, False)
+        assert exc_info.value.instance_id == "inst-1"
+        assert "(instance ID: inst-1)" in str(exc_info.value)
+
 
 class TestLogApiFailure:
     """Unit tests for _log_api_failure."""
@@ -418,6 +450,30 @@ class TestRunEnergyCalculation:
         assert exc_info.value.status_code == 400
         assert exc_info.value.problem_details == problem_details
         assert "rack height too small" in str(exc_info.value)
+
+    @patch("solarfarmer.endpoint_modelchains._log_api_failure")
+    @patch("solarfarmer.endpoint_modelchains.modelchain_async_call")
+    @patch("solarfarmer.endpoint_modelchains.check_for_3d_files", return_value=True)
+    @patch("solarfarmer.endpoint_modelchains._resolve_request_payload")
+    def test_failed_async_polling_raises_with_instance_id(
+        self, mock_resolve_payload, _mock_check_for_3d, mock_async_call, _mock_log_failure
+    ):
+        mock_resolve_payload.return_value = ('{"pvPlant":{}}', [])
+        mock_async_call.return_value = Response(
+            code=0,
+            url="https://api.example.com/modelchainasync",
+            data=None,
+            success=False,
+            method="GET",
+            exception="Could not get the calculation status after 6 attempt(s)",
+            instance_id="inst-1",
+        )
+
+        with pytest.raises(SolarFarmerAPIError) as exc_info:
+            run_energy_calculation(inputs_folder_path="/tmp/input-folder", project_id="project-1")
+
+        assert exc_info.value.instance_id == "inst-1"
+        assert "(instance ID: inst-1)" in str(exc_info.value)
 
     @patch("solarfarmer.endpoint_modelchains.modelchain_call", side_effect=RuntimeError("boom"))
     @patch("solarfarmer.endpoint_modelchains.check_for_3d_files", return_value=False)
@@ -612,7 +668,116 @@ class TestModelchainCall:
 
 
 class TestModelchainAsyncCall:
-    """Unit tests for modelchain_async_call URL selection."""
+    """Unit tests for modelchain_async_call URL selection and status polling."""
+
+    ASYNC_URL = "https://api.example.com/ModelChainAsync"
+
+    def _poll(self, code=200, data=None, success=True, exception=None):
+        return Response(
+            code=code,
+            url=self.ASYNC_URL,
+            data=data,
+            success=success,
+            method="GET",
+            exception=exception,
+        )
+
+    def _completed(self):
+        return self._poll(data={"instanceId": "inst-1", "runtimeStatus": "Completed", "output": {}})
+
+    def _call_with_polls(self, mock_client_cls, polls):
+        """Run modelchain_async_call with an accepted POST and the given status-poll results."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.post.return_value = Response(
+            code=200, url=self.ASYNC_URL, data={"id": "inst-1"}, success=True, method="POST"
+        )
+        mock_client.get.side_effect = polls
+        result = modelchain_async_call(
+            endpoint_url="ModelChainAsync",
+            api_version="latest",
+            api_url="https://api.example.com",
+            request_content='{"pvPlant":{}}',
+            files=[],
+            project_id="proj-1",
+        )
+        return mock_client, result
+
+    @pytest.mark.parametrize("code", [0, 429, 502, 503], ids=["network", "429", "502", "503"])
+    @patch("solarfarmer.endpoint_modelchains.time.sleep")
+    @patch("solarfarmer.endpoint_modelchains.Client")
+    def test_transient_poll_failure_is_retried(self, mock_client_cls, mock_sleep, code):
+        failed = self._poll(code=code, success=False, exception="transient")
+        mock_client, result = self._call_with_polls(mock_client_cls, [failed, self._completed()])
+
+        assert result.success
+        assert result.data["runtimeStatus"] == "Completed"
+        assert result.instance_id == "inst-1"
+        assert mock_client.get.call_count == 2
+        mock_sleep.assert_called_once_with(MODELCHAIN_ASYNC_POLL_TIME)
+
+    @patch("solarfarmer.endpoint_modelchains.time.sleep")
+    @patch("solarfarmer.endpoint_modelchains.Client")
+    def test_polling_gives_up_after_max_retries(self, mock_client_cls, mock_sleep):
+        failed = self._poll(code=0, success=False, exception="Network error: down")
+        mock_client, result = self._call_with_polls(
+            mock_client_cls, [failed] * (MODELCHAIN_ASYNC_MAX_POLL_RETRIES + 1)
+        )
+
+        assert not result.success
+        assert result.instance_id == "inst-1"
+        assert "may still be running" in result.exception
+        assert "Network error: down" in result.exception
+        assert mock_client.get.call_count == MODELCHAIN_ASYNC_MAX_POLL_RETRIES + 1
+        waits = [c.args[0] for c in mock_sleep.call_args_list]
+        assert len(waits) == MODELCHAIN_ASYNC_MAX_POLL_RETRIES
+        assert waits == sorted(waits)  # backoff never shrinks
+
+    @patch("solarfarmer.endpoint_modelchains.time.sleep")
+    @patch("solarfarmer.endpoint_modelchains.Client")
+    def test_non_retryable_poll_failure_stops_immediately(self, mock_client_cls, mock_sleep):
+        unauthorized = self._poll(code=401, success=False, exception="Unauthorized")
+        mock_client, result = self._call_with_polls(mock_client_cls, [unauthorized])
+
+        assert not result.success
+        assert result.code == 401
+        assert result.instance_id == "inst-1"
+        assert mock_client.get.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.parametrize("custom_status", [{}, "Queued", {"Status": None}])
+    @patch("solarfarmer.endpoint_modelchains.time.sleep")
+    @patch("solarfarmer.endpoint_modelchains.Client")
+    def test_unexpected_custom_status_does_not_stop_polling(
+        self, mock_client_cls, _mock_sleep, custom_status
+    ):
+        running = self._poll(data={"runtimeStatus": "Running", "customStatus": custom_status})
+        mock_client, result = self._call_with_polls(mock_client_cls, [running, self._completed()])
+
+        assert result.success
+        assert result.data["runtimeStatus"] == "Completed"
+        assert mock_client.get.call_count == 2
+
+    @patch("solarfarmer.endpoint_modelchains.time.sleep")
+    @patch("solarfarmer.endpoint_modelchains.Client")
+    def test_status_response_without_runtime_status_fails(self, mock_client_cls, mock_sleep):
+        _, result = self._call_with_polls(
+            mock_client_cls, [self._poll(data={"instanceId": "inst-1"})]
+        )
+
+        assert not result.success
+        assert result.instance_id == "inst-1"
+        assert "runtimeStatus" in result.exception
+        mock_sleep.assert_not_called()
+
+    @patch("solarfarmer.endpoint_modelchains.time.sleep")
+    @patch("solarfarmer.endpoint_modelchains.Client")
+    def test_unexpected_error_propagates_with_instance_id(self, mock_client_cls, _mock_sleep):
+        """Errors during polling are raised, not swallowed into the POST response."""
+        with pytest.raises(RuntimeError, match="boom") as exc_info:
+            self._call_with_polls(mock_client_cls, RuntimeError("boom"))
+
+        assert any("inst-1" in note for note in exc_info.value.__notes__)
 
     @patch("solarfarmer.endpoint_modelchains.Client")
     @patch("solarfarmer.endpoint_modelchains.build_api_url")

@@ -1,3 +1,4 @@
+import dataclasses
 import pathlib
 import time
 from datetime import datetime
@@ -6,6 +7,7 @@ from typing import IO, Any
 from .api import Client, Response, SolarFarmerAPIError, build_api_url
 from .config import (
     MODELCHAIN_ASYNC_ENDPOINT_URL,
+    MODELCHAIN_ASYNC_MAX_POLL_RETRIES,
     MODELCHAIN_ASYNC_TIMEOUT_CONNECTION,
     MODELCHAIN_ENDPOINT_URL,
     MODELCHAIN_TIMEOUT,
@@ -26,6 +28,11 @@ from .models import CalculationResults, ModelChainResponse
 from .models._base import SolarFarmerBaseModel
 
 _logger = get_logger("endpoint.modelchains")
+
+# Status-poll failures worth retrying: network errors (which Client reports as
+# code 0), request timeouts, rate limiting and transient server errors
+_RETRYABLE_POLL_STATUS_CODES = frozenset({0, 408, 429, 500, 502, 503, 504})
+_MAX_POLL_RETRY_WAIT = 60  # seconds
 
 
 def _validate_spec_ids_match_files(
@@ -202,7 +209,8 @@ def _handle_successful_response(
 
     Checks for async termination, extracts the ``runtimeStatus``, and
     either maps the response to a ``CalculationResults`` object (on
-    ``"Completed"``) or logs relevant error information and returns None.
+    ``"Completed"``), returns None (on ``"Terminated"``), or logs relevant
+    error information and raises.
 
     Parameters
     ----------
@@ -226,20 +234,34 @@ def _handle_successful_response(
     Returns
     -------
     CalculationResults or None
-        The mapped results on success, or None if the run was terminated,
-        cancelled, or failed
+        The mapped results on success, or None if the run was terminated
+
+    Raises
+    ------
+    SolarFarmerAPIError
+        If an async calculation failed, was cancelled or ended with an unknown
+        status, or if an async response has no ``runtimeStatus``
     """
+    is_async = "modelchainasync" in response.url.lower()
+    runtime_status = response.data.get("runtimeStatus")
+
+    # Mapping an async response without a status (e.g. the POST acknowledgement)
+    # would produce an empty CalculationResults instead of an error
+    if is_async and runtime_status is None:
+        raise SolarFarmerAPIError(
+            status_code=response.code,
+            message="Async calculation response did not include a runtimeStatus",
+            instance_id=response.instance_id,
+        )
+
     # GET + "Terminated" on the async endpoint means the user cancelled
-    if (
-        response.method == "GET"
-        and "modelchainasync" in response.url.lower()
-        and response.data["runtimeStatus"] == "Terminated"
-    ):
+    if response.method == "GET" and is_async and runtime_status == "Terminated":
         _logger.info("Calculation terminated after %.1f seconds.", elapsed_time)
         return None
 
-    # Extract runtime status (sync calls don't include one)
-    runtime_status = response.data.get("runtimeStatus", "Completed")
+    # Sync calls don't include a runtime status
+    if runtime_status is None:
+        runtime_status = "Completed"
 
     if runtime_status == "Completed":
         _logger.info(
@@ -278,7 +300,7 @@ def _handle_successful_response(
     message = f"Async calculation ended with status '{runtime_status}'"
     if output_message:
         message += f": {output_message}"
-    raise SolarFarmerAPIError(status_code=200, message=message)
+    raise SolarFarmerAPIError(status_code=200, message=message, instance_id=response.instance_id)
 
 
 def _log_api_failure(response: Response, elapsed_time: float) -> None:
@@ -496,6 +518,7 @@ def run_energy_calculation(
             status_code=response.code,
             message=response.exception or "API request failed",
             problem_details=response.problem_details_json,
+            instance_id=response.instance_id,
         )
 
 
@@ -560,6 +583,74 @@ def modelchain_call(
     return response
 
 
+def _parse_custom_status(
+    custom_status: Any, have_written_plant_info: bool
+) -> tuple[str, str, bool]:
+    """
+    Extract the status and progress strings from an async ``customStatus`` payload.
+
+    Logs the plant information the first time it is present.
+
+    Parameters
+    ----------
+    custom_status : Any
+        The ``customStatus`` value from a ModelChainAsync status response, or None
+    have_written_plant_info : bool
+        Whether the plant information has already been logged
+
+    Returns
+    -------
+    tuple[str, str, bool]
+        The custom status string, the progress string, and the updated
+        ``have_written_plant_info`` flag
+
+    Raises
+    ------
+    AttributeError, KeyError, TypeError, ValueError
+        If ``custom_status`` does not have the expected shape
+    """
+    custom_status_string = "Custom status not received"
+    progress_string = "No progress returned"
+    if custom_status is None:
+        return custom_status_string, progress_string, have_written_plant_info
+
+    if "PlantInfo" in custom_status:
+        if not have_written_plant_info:
+            plant_info = custom_status["PlantInfo"]
+            if plant_info is not None:
+                _logger.info("%s", get_plant_info_string(plant_info))
+                have_written_plant_info = True
+            else:
+                _logger.debug("Plant info not received this time")
+    custom_status_string = custom_status["Status"]
+    if "CalculationProgress" in custom_status:
+        calculation_progress = custom_status["CalculationProgress"]
+        shading_progress = 0
+        overall_progress = 0
+        model_chain_progress = 0
+        if calculation_progress is not None:
+            calculation_progress = lowercase_keys_in_dict(calculation_progress)
+            if (
+                "shadingprogress" in calculation_progress
+                and "modelchainprogress" in calculation_progress
+                and "overallprogress" in calculation_progress
+            ):
+                shading_progress = float(calculation_progress["shadingprogress"])
+                model_chain_progress = float(calculation_progress["modelchainprogress"])
+                overall_progress = float(calculation_progress["overallprogress"])
+            else:
+                # no recognized progress keys - just log the string
+                _logger.debug("Unrecognized progress: %s", calculation_progress)
+        parts = [
+            f"Shading: {shading_progress * 100.0:.1f}%",
+            f"ModelChain: {model_chain_progress * 100.0:.1f}%",
+            f"Overall: {overall_progress * 100.0:.1f}%",
+        ]
+        progress_string = "[" + ", ".join(parts) + "]"
+
+    return custom_status_string, progress_string, have_written_plant_info
+
+
 def modelchain_async_call(
     endpoint_url: str,
     api_version: str,
@@ -601,7 +692,16 @@ def modelchain_async_call(
     -------
     Response
         The final GET response when ``runtimeStatus`` reaches a terminal state,
-        or the POST response if it fails or an exception occurs during polling
+        or a failed response if the POST fails or the status cannot be
+        retrieved. Every response after a successful POST carries the
+        calculation's ``instance_id``.
+
+    Notes
+    -----
+    Status checks that fail with a network error, or with HTTP 408, 429 or 5xx,
+    are retried with exponential backoff, up to ``MODELCHAIN_ASYNC_MAX_POLL_RETRIES``
+    consecutive failures. Other failures stop polling at once. In both cases the
+    calculation may still be running on the server.
     """
 
     poll_frequency, kwargs = extract_poll_frequency(**kwargs)
@@ -640,115 +740,95 @@ def modelchain_async_call(
     # retrieving the status of the calculation
     seconds_per_poll_check = poll_frequency
     iteration_number = 1
-    is_finished = False
-    was_successful = False
+    failed_polls = 0
     have_written_plant_info = False
-    while not is_finished:
-        try:
-            response_from_get = client.get(params={"InstanceId": instance_id, **kwargs})
+    try:
+        while True:
+            response_from_get = dataclasses.replace(
+                client.get(params={"InstanceId": instance_id, **kwargs}), instance_id=instance_id
+            )
+            data = response_from_get.data
+            runtime_status = data.get("runtimeStatus") if isinstance(data, dict) else None
 
-            if response_from_get.success:
-                json_response_text = response_from_get.data
-                custom_status_string = "Custom status not received"
-                progress_string = "No progress returned"
-                if "customStatus" in json_response_text:
-                    custom_status = json_response_text["customStatus"]
-                    if custom_status is not None:
-                        if "PlantInfo" in custom_status:
-                            if not have_written_plant_info:
-                                plant_info = custom_status["PlantInfo"]
-                                if plant_info is not None:
-                                    _logger.info("%s", get_plant_info_string(plant_info))
-                                    have_written_plant_info = True
-                                else:
-                                    _logger.debug("Plant info not received this time")
-                        custom_status_string = custom_status["Status"]
-                        if "CalculationProgress" in custom_status:
-                            calculation_progress = custom_status["CalculationProgress"]
-                            shading_progress = 0
-                            overall_progress = 0
-                            model_chain_progress = 0
-                            if calculation_progress is not None:
-                                calculation_progress = lowercase_keys_in_dict(calculation_progress)
-                                if (
-                                    "shadingprogress" in calculation_progress
-                                    and "modelchainprogress" in calculation_progress
-                                    and "overallprogress" in calculation_progress
-                                ):
-                                    shading_progress = float(
-                                        calculation_progress["shadingprogress"]
-                                    )
-                                    model_chain_progress = float(
-                                        calculation_progress["modelchainprogress"]
-                                    )
-                                    overall_progress = float(
-                                        calculation_progress["overallprogress"]
-                                    )
-                                    progress_string = f"[Shading: {shading_progress * 100.0:.1f}%, ModelChain: {model_chain_progress * 100.0:.1f}%, Overall: {overall_progress * 100.0:.1f}%]"
-                                else:
-                                    # no recognized progress keys - just log the string
-                                    _logger.debug("Unrecognized progress: %s", calculation_progress)
-                            parts = [
-                                f"Shading: {shading_progress * 100.0:.1f}%",
-                                f"ModelChain: {model_chain_progress * 100.0:.1f}%",
-                                f"Overall: {overall_progress * 100.0:.1f}%",
-                            ]
-                            progress_string = "[" + ", ".join(parts) + "]"
-                else:
-                    custom_status_string = "Custom status not received"
-
-                runtime_status = json_response_text["runtimeStatus"]
-
-                # Estimate current run time
-                time_since_start = datetime.now() - start_time
-
-                summarized_custom_status = summarize_custom_status_string(custom_status_string)
-
-                # Log status
-                _logger.info(
-                    "%2d: Time: %s \tRun status: %s \tCustom status: %s  %s",
-                    iteration_number,
-                    format_timedelta(time_since_start, "{hours_total}:{minutes2}:{seconds2}"),
-                    runtime_status,
-                    summarized_custom_status,
-                    progress_string,
-                )
-
-                if runtime_status == "Completed":
-                    is_finished = True
-                    was_successful = True
-                elif (
-                    runtime_status == "Failed"
-                    or runtime_status == "Canceled"
-                    or runtime_status == "Terminated"
-                    or runtime_status == "Unknown"
+            if not response_from_get.success or runtime_status is None:
+                failed_polls += 1
+                if (
+                    not response_from_get.success
+                    and response_from_get.code in _RETRYABLE_POLL_STATUS_CODES
+                    and failed_polls <= MODELCHAIN_ASYNC_MAX_POLL_RETRIES
                 ):
-                    is_finished = True
-                    was_successful = False
-            else:
-                _logger.error("API request %s failed.", client.base_url)
-                is_finished = True
-                was_successful = False
+                    wait = min(
+                        seconds_per_poll_check * 2 ** (failed_polls - 1), _MAX_POLL_RETRY_WAIT
+                    )
+                    _logger.warning(
+                        "Status check %d failed (%s); retrying in %.0f seconds",
+                        failed_polls,
+                        response_from_get.exception,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
+                last_error = response_from_get.exception or "status response has no runtimeStatus"
+                message = (
+                    f"Could not get the calculation status after {failed_polls} attempt(s); "
+                    f"the calculation may still be running on the server. Last error: {last_error}"
+                )
+                _logger.error("%s Instance ID = %s", message, instance_id)
+                return dataclasses.replace(response_from_get, success=False, exception=message)
+
+            failed_polls = 0
+
+            # Progress reporting is informational: an unexpected customStatus shape
+            # must not stop polling a calculation that is still running
+            try:
+                custom_status_string, progress_string, have_written_plant_info = (
+                    _parse_custom_status(data.get("customStatus"), have_written_plant_info)
+                )
+                summarized_custom_status = summarize_custom_status_string(custom_status_string)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                _logger.debug(
+                    "Unrecognized custom status: %s", data.get("customStatus"), exc_info=True
+                )
+                summarized_custom_status = "Custom status not recognized"
+                progress_string = "No progress returned"
+
+            # Estimate current run time
+            time_since_start = datetime.now() - start_time
+
+            # Log status
+            _logger.info(
+                "%2d: Time: %s \tRun status: %s \tCustom status: %s  %s",
+                iteration_number,
+                format_timedelta(time_since_start, "{hours_total}:{minutes2}:{seconds2}"),
+                runtime_status,
+                summarized_custom_status,
+                progress_string,
+            )
+
+            if runtime_status == "Completed":
+                return response_from_get
+            if runtime_status in ("Failed", "Canceled", "Terminated", "Unknown"):
+                if runtime_status == "Terminated":
+                    _logger.error(
+                        "The calculation was terminated. Reason given = %s", data.get("output")
+                    )
+                else:
+                    _logger.error(
+                        "The calculation was not successful. Runtime status = %s", runtime_status
+                    )
                 return response_from_get
 
-        except Exception:
-            _logger.exception("Exception thrown in the script")
-            return response_from_post
-
-        # wait as for the poll frequency
-        time.sleep(seconds_per_poll_check)
-        iteration_number += 1
-
-    if was_successful:
-        return response_from_get
-
-    else:
-        if runtime_status == "Terminated":
-            reason_string = json_response_text["output"]
-            _logger.error("The calculation was terminated. Reason given = %s", reason_string)
-        else:
-            _logger.error("The calculation was not successful. Runtime status = %s", runtime_status)
-        return response_from_get
+            # wait as for the poll frequency
+            time.sleep(seconds_per_poll_check)
+            iteration_number += 1
+    except Exception as exc:
+        # Don't swallow errors here: keep the instance ID with the exception so the
+        # calculation, which may still be running, can be found again
+        exc.add_note(
+            f"SolarFarmer calculation instance ID: {instance_id} (it may still be running)"
+        )
+        raise
 
 
 def process_and_map_results(

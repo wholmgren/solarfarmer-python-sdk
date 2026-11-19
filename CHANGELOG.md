@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SolarFarmerAPIError.instance_id` holds the instance ID of an asynchronous (3D) calculation when one
+  was started, so the calculation can still be found or terminated after an error. It is also shown in
+  the error message.
+- `MODELCHAIN_ASYNC_MAX_POLL_RETRIES` (default `5`) sets how many consecutive failed status checks are
+  retried before polling an asynchronous calculation gives up.
+
 ### Fixed
 
+- Polling an asynchronous (3D) calculation no longer gives up on the first failed status check. Network
+  errors and HTTP 408, 429 and 5xx responses are retried with exponential backoff; previously a single
+  failure raised `SolarFarmerAPIError` while the calculation kept running on the server.
+- An unexpected `customStatus` in a status response no longer makes `run_energy_calculation` return an
+  empty `CalculationResults` (NaN energy) or fail with an unrelated `TypeError`. The custom status only
+  affects progress logging now, and other errors raised while polling propagate instead of being
+  swallowed.
+- An asynchronous response without a `runtimeStatus` now raises `SolarFarmerAPIError` instead of being
+  treated as `"Completed"`.
 - `__released__` now reports the release date of installed wheels instead of `"unreleased"` or the tag
   date of whichever git repository the user's working directory belonged to. It is also exposed at the
   package top level, like `solarfarmer.__version__`; previously `import solarfarmer as sf; sf.__released__`

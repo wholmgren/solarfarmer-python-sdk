@@ -28,6 +28,7 @@ class Response:
     method: str
     exception: str | None = None
     problem_details_json: dict | None = None
+    instance_id: str | None = None
 
     def __repr__(self) -> str:
         return f"status code={self.code}, url={self.url}, method={self.method}"
@@ -45,6 +46,9 @@ class SolarFarmerAPIError(Exception):
     problem_details : dict or None
         Full ProblemDetails JSON body from the API, if available.
         May contain ``title``, ``detail``, and ``errors`` fields.
+    instance_id : str or None
+        Instance ID of the asynchronous (3D) calculation, if one was started.
+        The calculation may still be running on the server when this is set.
 
     Examples
     --------
@@ -61,11 +65,13 @@ class SolarFarmerAPIError(Exception):
         status_code: int,
         message: str,
         problem_details: dict | None = None,
+        instance_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.problem_details = problem_details
+        self.instance_id = instance_id
 
     def __str__(self) -> str:
         base = f"HTTP {self.status_code}: {self.message}"
@@ -73,6 +79,8 @@ class SolarFarmerAPIError(Exception):
             detail = self.problem_details.get("detail")
             if detail:
                 base += f" — {detail}"
+        if self.instance_id:
+            base += f" (instance ID: {self.instance_id})"
         return base
 
 

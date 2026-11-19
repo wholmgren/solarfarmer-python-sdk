@@ -23,6 +23,7 @@ __all__ = [
     "MODELCHAIN_ASYNC_TIMEOUT_CONNECTION",
     "MODELCHAIN_ASYNC_TIMEOUT_UPLOAD",
     "MODELCHAIN_ASYNC_POLL_TIME",
+    "MODELCHAIN_ASYNC_MAX_POLL_RETRIES",
     "PANDAS_INSTALL_MSG",
     # RCL
     "RCL_BASE_URL",
@@ -56,6 +57,7 @@ MODELCHAIN_TIMEOUT = 600  # 10 mins
 MODELCHAIN_ASYNC_TIMEOUT_CONNECTION = 7200  # 2 hours
 MODELCHAIN_ASYNC_TIMEOUT_UPLOAD = 60
 MODELCHAIN_ASYNC_POLL_TIME = 4  # Polling frequency for the status of ModelChainAsync calculations
+MODELCHAIN_ASYNC_MAX_POLL_RETRIES = 5  # Consecutive failed status polls retried before giving up
 
 PANDAS_INSTALL_MSG = (
     "pandas is required for this function. Install it with: pip install 'dnv-solarfarmer[weather]'"
